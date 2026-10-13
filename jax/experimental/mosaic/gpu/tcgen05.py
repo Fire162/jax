@@ -170,10 +170,12 @@ def _create_scaled_instr_descriptor(
     scale_encoding = 1
   elif scale_type == ir.Float8E4M3FNType.get():
     scale_encoding = 0
+  elif scale_type == ir.Float8E5M3FNUType.get():
+    scale_encoding = 2
   else:
     raise NotImplementedError(f"Unsupported scale type: {scale_type}")
-  desc |= scale_encoding << 23  # Scale matrix type
-  # Bits 24-26 are reserved
+  desc |= scale_encoding << 23  # Scale matrix type, bits 23-25
+  # Bit 26 is reserved
   if m % 128 or m > 256:
     raise ValueError(f"M must be a multiple of 16 and <= 256, got: {m}")
   desc |= (m >> 7) << 27  # M >> 7, bits 27-28
@@ -473,15 +475,25 @@ def mma(
         )
     elif isinstance(a_element_type, ir.Float4E2M1FNType):
       if not isinstance(
-          scale_element_type, (ir.Float8E8M0FNUType, ir.Float8E4M3FNType)
+          scale_element_type,
+          (ir.Float8E8M0FNUType, ir.Float8E4M3FNType, ir.Float8E5M3FNUType),
       ):
         raise ValueError(
-            "Scale element type mismatch: expected f8e8m0fnu or f8e4m3fn, got"
-            f" {scale_element_type}"
+            "Scale element type mismatch: expected f8e8m0fnu, f8e4m3fn, or"
+            f" f8e5m3fnu, got {scale_element_type}"
         )
       arch = utils.get_arch()
-      if isinstance(scale_element_type, ir.Float8E4M3FNType) and not (
-          arch.major == 10 and arch.minor >= 7
+      if (
+          isinstance(scale_element_type, ir.Float8E5M3FNUType)
+          and arch < utils.RUBIN
+      ):
+        raise ValueError(
+            "E5M3FNU scale factors are only supported on sm_107+, got"
+            f" sm_{arch.major}{arch.minor}."
+        )
+      if (
+          isinstance(scale_element_type, ir.Float8E4M3FNType)
+          and arch < utils.RUBIN
       ):
         allowed_base_blocks = (16,)
       else:
@@ -744,7 +756,8 @@ def _do_mma(
       base_scale_block = scale_block // (2 if is_sparse else 1)
       assert base_scale_block in (16, 32)
       assert isinstance(
-          scale_element_type, (ir.Float8E8M0FNUType, ir.Float8E4M3FNType)
+          scale_element_type,
+          (ir.Float8E8M0FNUType, ir.Float8E4M3FNType, ir.Float8E5M3FNUType),
       )
       if base_scale_block == 32:
         kind = "mxf4nvf4.block_scale.scale_vec::2X"
@@ -1930,8 +1943,15 @@ def async_copy_scales_smem_to_tmem(
   smem_ty = ir.MemRefType(smem_ref.type)
   if (dtype := smem_ty.element_type) != tmem_ref.dtype:
     raise ValueError(f"Incompatible dtypes: SMEM has {dtype}, TMEM has {tmem_ref.dtype}")
-  if dtype not in {ir.Float8E8M0FNUType.get(), ir.Float8E4M3FNType.get()}:
-    raise ValueError(f"Unsupported dtype: {dtype}, only f8e8m0fnu and f8e4m3fn are supported")
+  if dtype not in {
+      ir.Float8E8M0FNUType.get(),
+      ir.Float8E4M3FNType.get(),
+      ir.Float8E5M3FNUType.get(),
+  }:
+    raise ValueError(
+        f"Unsupported dtype: {dtype}, only f8e8m0fnu, f8e4m3fn, and f8e5m3fnu"
+        " are supported"
+    )
   if tmem_ref.shape[0] % TMEM_ROWS:
     raise ValueError(f"TMEM reference must have a multiple of {TMEM_ROWS} rows, but got {tmem_ref.shape[0]}")
   if tmem_ref.shape[1] % 4:
