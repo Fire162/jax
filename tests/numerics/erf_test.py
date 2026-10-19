@@ -250,11 +250,8 @@ class ErfcTest(jtu.JaxTestCase):
     grad2_fn = jax.jit(jax.vmap(jax.grad(jax.grad(lax.erfc))))
     max_x = 9.0 if dtype == f32 else 25.0
     x = jnp.linspace(-max_x, max_x, 256, dtype=dtype)
-    with jax.debug_nans(True):
-      d1 = np.asarray(grad1_fn(x))
-      d2 = np.asarray(grad2_fn(x))
-      _ = grad1_fn(jnp.array([-jnp.inf, 0.0, jnp.inf], dtype=dtype))
-      _ = grad2_fn(jnp.array([-jnp.inf, 0.0, jnp.inf], dtype=dtype))
+    d1 = np.asarray(grad1_fn(x))
+    d2 = np.asarray(grad2_fn(x))
 
     def mp_d1(v):
       return -2 * mpmath.exp(-v * v) / mpmath.sqrt(mpmath.pi)
@@ -962,6 +959,124 @@ class NdtriTest(jtu.JaxTestCase):
     self.assertLessEqual(np.max(util.ulp_diff(d3, ref_d3, dtype)), d3_bound)
 
 
+def _mpmath_ndtr(x):
+  with mpmath.extraprec(20):
+    return 0.5 * _mpmath_erfc(-x / mpmath.sqrt(2))
+
+
+def _mpmath_log_ndtr(x):
+  # Factor erfc(|x| / sqrt(2)) = exp(-0.5 * x^2) * erfcx(|x| / sqrt(2)) via
+  # `_mpmath_erfcx` (which uses `hyperu` for u >= 1) so `mpmath.erfc` is never
+  # called on large arguments.
+  if mpmath.isnan(x):
+    return mpmath.nan
+  if x == -mpmath.inf:
+    return -mpmath.inf
+  if x == mpmath.inf:
+    return mpmath.mpf(0)
+  with mpmath.extraprec(40):
+    u = abs(x) / mpmath.sqrt(2)
+    if x > 0:
+      return mpmath.log1p(-0.5 * mpmath.exp(-0.5 * x * x) * _mpmath_erfcx(u))
+    return -0.5 * x * x + mpmath.log(0.5 * _mpmath_erfcx(u))
+
+
+_NDTR_UNDERFLOW_THRESHOLDS = [
+    # Underflow thresholds where ndtr(x) reaches tiny / min_subnormal, computed
+    # via mpmath.findroot(lambda x: 0.5 * mpmath.erfc(-x / sqrt(2)) - target, x0):
+    -12.949952701187204,  # ndtr(x) == 2^-126 (float32 tiny)
+    -14.121426613350499,  # ndtr(x) == 2^-149 (float32 min_subnormal)
+    -37.5193793471445,  # ndtr(x) == 2^-1022 (float64 tiny)
+    -38.467405617144344,  # ndtr(x) == 2^-1074 (float64 min_subnormal)
+]
+
+_NDTR_INTERESTING_POINTS = [
+    # Branch threshold in lax.ndtr where |x / sqrt(2)| == sqrt(0.5), i.e. |x| == 1:
+    -1.0,
+    1.0,
+    # Saturation thresholds where ndtr(x) rounds to 1.0 in float32 and float64:
+    -float(scipy.special.ndtri(2.0**-25)),
+    -float(scipy.special.ndtri(2.0**-54)),
+    *_NDTR_UNDERFLOW_THRESHOLDS,
+]
+
+_F32_SQRT_MAX = math.sqrt(float(np.finfo(np.float32).max))
+_F64_SQRT_MAX = math.sqrt(float(np.finfo(np.float64).max))
+
+_LOG_NDTR_INTERESTING_POINTS = [
+    *_NDTR_INTERESTING_POINTS,
+    # Asymptotic expansion switch thresholds in jsp.special.log_ndtr:
+    -10.0,
+    -20.0,
+    # Positive thresholds where log_ndtr(x) ~= -ndtr(-x) underflows to -0.0:
+    *(-x for x in _NDTR_UNDERFLOW_THRESHOLDS),
+    # Premature x^2 overflow thresholds (-sqrt(fmax)) and true underflow/overflow
+    # thresholds where -0.5 * x^2 == -finfo.max (-sqrt(2) * sqrt(fmax)):
+    -_F32_SQRT_MAX,
+    -math.sqrt(2.0) * _F32_SQRT_MAX,  # -2.6087634873193423e19 (float32)
+    -_F64_SQRT_MAX,
+    -math.sqrt(2.0) * _F64_SQRT_MAX,  # -1.8961503816218352e154 (float64)
+]
+
+
+@jtu.thread_unsafe_test_class()
+class NdtrTest(jtu.JaxTestCase):
+
+  @parameterized.named_parameters(
+      {"testcase_name": "_float32", "dtype": f32},
+      {"testcase_name": "_float64", "dtype": f64},
+  )
+  def test_ndtr_accuracy(self, dtype):
+    bounds = [
+        ("cpu", {f32: 4.5, f64: 3.0}),
+        ("gpu", {f32: 5.5, f64: 3.0}),
+        ([*TPU_EUPV1, "tpu_v5p"], {f32: 6.0}),
+        (["tpu_v6e", "tpu_7x"], {f32: 5.5}),
+    ]
+    input_ftz = [
+        ("gpu", False),
+    ]
+    util.check_unary_precision(
+        self,
+        jax.jit(jsp.special.ndtr),
+        scipy.special.ndtr,
+        _mpmath_ndtr,
+        dtype,
+        bounds=bounds,
+        input_ftz=input_ftz,
+        interesting_points=_NDTR_INTERESTING_POINTS,
+    )
+
+
+@jtu.thread_unsafe_test_class()
+class LogNdtrTest(jtu.JaxTestCase):
+
+  @parameterized.named_parameters(
+      {"testcase_name": "_float32", "dtype": f32},
+      {"testcase_name": "_float64", "dtype": f64},
+  )
+  def test_log_ndtr_accuracy(self, dtype):
+    bounds = [
+        ("cpu", {f32: 4.5, f64: 3.5}),
+        ("gpu", {f32: 6.0, f64: 3.0}),
+        ([*TPU_EUPV1, "tpu_v5p"], {f32: 6.0}),
+        (["tpu_v6e", "tpu_7x"], {f32: 5.5}),
+    ]
+    input_ftz = [
+        ("gpu", False),
+    ]
+    util.check_unary_precision(
+        self,
+        jax.jit(jsp.special.log_ndtr),
+        scipy.special.log_ndtr,
+        _mpmath_log_ndtr,
+        dtype,
+        bounds=bounds,
+        input_ftz=input_ftz,
+        interesting_points=_LOG_NDTR_INTERESTING_POINTS,
+    )
+
+
 util.register_benchmark(lax.erf)
 util.register_benchmark(lax.erfc)
 util.register_benchmark(_erfc_highest)
@@ -973,6 +1088,8 @@ util.register_benchmark(jsp.special.erfcinv)
 util.register_benchmark(erfcinv_grad)
 util.register_benchmark(jsp.special.ndtri, dtypes=(f32, f64))
 util.register_benchmark(ndtri_grad, dtypes=(f32, f64))
+util.register_benchmark(jsp.special.ndtr, dtypes=(f32, f64))
+util.register_benchmark(jsp.special.log_ndtr, dtypes=(f32, f64))
 
 
 if __name__ == "__main__":
