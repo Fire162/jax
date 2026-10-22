@@ -13,6 +13,15 @@ Remember to align the itemized text with the first line of an item within a list
 
 ## Unreleased
 
+* New features
+  * The Pallas API is now available as `jax.pallas`
+    (`from jax import pallas as pl`), `jax.pallas.tpu`
+    (`from jax.pallas import tpu as pltpu`), `jax.pallas.tpu_sc`
+    (`from jax.pallas import tpu_sc as plsc`), `jax.pallas.mosaic_gpu`
+    (`from jax.pallas import mosaic_gpu as plgpu`), and `jax.pallas.fuser`
+    (`from jax.pallas import fuser`). Existing imports from
+    `jax.experimental.pallas` remain valid.
+
 ### Mosaic GPU
 
 * New features
