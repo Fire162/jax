@@ -204,6 +204,8 @@ class CustomCallBackendConfig:
   tiling: Tiling | None = None  # Only used for SparseCore.
   opt_level: OptLevel | None = None  # Only used for SparseCore.
   debug_locations: bytes | None = None
+  # The kernel never reads or writes its operands or outputs. Not serialized.
+  buffers_untouched: bool = False
 
   def __post_init__(self):
     if self.allow_input_fusion is not None:
@@ -472,6 +474,15 @@ def _tpu_custom_call_lowering(
     config = config.downgrade_lowered_module_asm(ir_version)
   # TODO(b/536052236): Always use core_ids after 2026-11-06.
   use_core_ids = not ctx.is_forward_compat()
+  # Leave the layouts of buffers the kernel never touches to XLA, unless
+  # SparseCore tiling flattens them in row major order. Exported modules and
+  # older libtpu keep them row major, since older compilers reject others.
+  any_layout = (
+      config.buffers_untouched
+      and config.tiling is not Tiling.SPARSE_CORE
+      and not ctx.is_forward_compat()
+      and cloud_tpu_init.is_libtpu_at_least("0.0.52")
+  )
   call = mlir.custom_call(
       "tpu_custom_call",
       result_types=result_types,
@@ -480,8 +491,8 @@ def _tpu_custom_call_lowering(
       api_version=1,
       has_side_effect=has_side_effects != TpuSideEffectType.PURE,
       operand_output_aliases=dict(input_output_aliases),
-      operand_layouts=_avals_to_layouts(ctx.avals_in),
-      result_layouts=_avals_to_layouts(ctx.avals_out),
+      operand_layouts=None if any_layout else _avals_to_layouts(ctx.avals_in),
+      result_layouts=None if any_layout else _avals_to_layouts(ctx.avals_out),
       result_shapes=result_shapes,
       extra_attributes=extra_attributes,
   )
@@ -583,6 +594,52 @@ def _get_device_type(module: ir.Module) -> str | None:
   if sparsecore_func_found:
     return "sparsecore"
   return None
+
+
+def _buffers_untouched(module: ir.Module) -> bool:
+  """Returns whether a SparseCore kernel never uses its operands or outputs.
+
+  Such a kernel, like a lock that only orders work around a buffer, works with
+  any layout of its buffers, as long as they live in HBM.
+  """
+  kernels = [
+      op
+      for op in module.body.operations
+      if op.operation.name == "func.func" and "tpu.core_type" in op.attributes
+  ]
+  for kernel in kernels:
+    if (
+        str(kernel.attributes["tpu.core_type"])
+        not in (
+            "#tpu.core_type<sc_scalar_subcore>",
+            "#tpu.core_type<sc_vector_subcore>",
+        )
+        or "iteration_bounds" not in kernel.attributes
+    ):
+      return False
+    # Arguments: one index per grid dimension, the operands and outputs, then
+    # the scratch operands.
+    args = list(kernel.regions[0].blocks[0].arguments)
+    num_grid_indices = len(
+        ir.DenseI64ArrayAttr(kernel.attributes["iteration_bounds"])
+    )
+    num_scratch = (
+        ir.IntegerAttr(kernel.attributes["scratch_operands"]).value
+        if "scratch_operands" in kernel.attributes
+        else 0
+    )
+    for arg in args[num_grid_indices : len(args) - num_scratch]:
+      if not isinstance(arg.type, ir.MemRefType):
+        return False
+      memory_space = arg.type.memory_space
+      if memory_space is not None and str(memory_space) not in (
+          "#tpu.memory_space<hbm>",
+          "#tpu.memory_space<any>",
+      ):
+        return False
+      if any(True for _ in arg.uses):
+        return False
+  return bool(kernels)
 
 
 def _get_active_core_count(module: ir.Module) -> int | None:
@@ -733,6 +790,7 @@ def _lower_to_custom_call_config(
       opt_level=opt_level,
       ctx=ctx,
       debug_locations=debug_locations,
+      buffers_untouched=_buffers_untouched(module),
   )
 
 
@@ -766,6 +824,7 @@ def _lowered_to_custom_call_config(
     kernel_name: str | None = None,
     ctx: mlir.LoweringRuleContext | None = None,
     debug_locations: bytes | None = None,
+    buffers_untouched: bool = False,
 ):
   config_mode = config.jax_pallas_auto_assign_collective_ids.value
   id_limit = config.jax_pallas_auto_assign_collective_ids_limit.value
@@ -872,6 +931,7 @@ def _lowered_to_custom_call_config(
       tiling=tiling,
       opt_level=opt_level,
       debug_locations=debug_locations,
+      buffers_untouched=buffers_untouched,
   )
 
 
