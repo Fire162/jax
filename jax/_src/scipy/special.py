@@ -47,7 +47,6 @@ from jax._src.numpy import vectorize as jnp_vectorize
 from jax._src.numpy.util import promote_args_complex, promote_args_inexact, promote_dtypes_inexact
 from jax._src.ops import special as ops_special
 from jax._src.scipy.gamma import gamma_real
-from jax._src.third_party.scipy.betaln import betaln as _betaln_impl
 from jax._src.typing import Array, ArrayLike
 from jax._src.nn.functions import softmax as nn_softmax
 from jax._src.nn.functions import log_softmax as nn_log_softmax
@@ -319,6 +318,313 @@ def gamma(x: ArrayLike) -> Array:
   return gamma_real(x.astype(np.float32)).astype(x.dtype)
 
 
+# Bernoulli coefficients B_{2k+2} / ((2k+1)(2k+2)) for the Stirling remainder
+# of log(Gamma(z)) for z >= 8, in ascending degree order for lax.polynomial.
+_STIRLING_REM_COEFFS_F64 = (
+    1.0 / 12.0,
+    -1.0 / 360.0,
+    1.0 / 1260.0,
+    -1.0 / 1680.0,
+    1.0 / 1188.0,
+    -691.0 / 360360.0,
+    1.0 / 156.0,
+)
+_STIRLING_REM_COEFFS_F32 = (
+    1.0 / 12.0,
+    -1.0 / 360.0,
+    1.0 / 1260.0,
+)
+
+# Taylor coefficients (-1)^{k-1} / (k * (k + 1)) for ((1 + h) * log(1 + h) - h) / h^2,
+# in ascending degree order for lax.polynomial.
+_BETALN_DELTA_COEFFS_F64 = tuple(
+    ((-1) ** (k - 1)) / (k * (k + 1)) for k in range(1, 11)
+)
+_BETALN_DELTA_COEFFS_F32 = tuple(
+    ((-1) ** (k - 1)) / (k * (k + 1)) for k in range(1, 7)
+)
+
+
+def _stirling_remainder(x: Array) -> Array:
+  """Computes the Stirling series remainder R(x) = log(Gamma(x)) - (x - 0.5)*log(x) + x - 0.5*log(2*pi)."""
+  # For x >= sqrt(MAX_FLOAT), R(x) = 1 / (12 * x) < eps^2 is negligible in
+  # both value and derivatives; clamping avoids 1 / inf when x = u + v overflows.
+  sqrt_max = _lax_const(x, math.sqrt(float(dtypes.finfo(x.dtype).max)))
+  x_safe = jnp.where(x < sqrt_max, x, sqrt_max)
+  inv_x = 1.0 / x_safe
+  inv_x2 = lax.square(inv_x)
+  coeffs = (
+      _STIRLING_REM_COEFFS_F64
+      if x.dtype == np.float64
+      else _STIRLING_REM_COEFFS_F32
+  )
+  rem = inv_x * lax.polynomial(inv_x2, coeffs, unroll=len(coeffs))
+  return jnp.where(x < sqrt_max, rem, 0.0)
+
+
+def _betaln_delta(p: Array, q: Array, h: Array) -> Array:
+  """Computes p - (p + q - 0.5) * log1p(p / q) without catastrophic cancellation."""
+  coeffs = (
+      _BETALN_DELTA_COEFFS_F64
+      if p.dtype == np.float64
+      else _BETALN_DELTA_COEFFS_F32
+  )
+  h_small = jnp.where(h < 0.0625, h, 0.0)
+  poly = lax.polynomial(h_small, coeffs, unroll=len(coeffs))
+  l1p = jnp.log1p(h)
+  small_h = 0.5 * l1p - p * (h_small * poly)
+  large_h = p - p * l1p - (q - 0.5) * l1p
+  return jnp.where(h < 0.0625, small_h, large_h)
+
+
+def _betaln_pos(u: Array, v: Array) -> Array:
+  """Computes betaln(u, v) for strictly positive finite u, v > 0."""
+  valid = (u > 0) & (v > 0) & jnp.isfinite(u) & jnp.isfinite(v)
+  u = jnp.where(valid, u, 1.0)
+  v = jnp.where(valid, v, 1.0)
+  p = jnp.where(u <= v, u, v)
+  q = jnp.where(u <= v, v, u)
+
+  # Regimes 1, 2, and 3 share just three lax.lgamma evaluations.
+  # Mask inputs >= 8 to 1.0 so lgamma never overflows in unselected branches,
+  # and shift any argument < 0.5 by +1 via lgamma(x) = lgamma(x + 1) - log(x)
+  # so lax.lgamma is never evaluated near 0 or on subnormal inputs.
+  u_lt_8 = jnp.where(u < 8.0, u, 1.0)
+  v_lt_8 = jnp.where(v < 8.0, v, 1.0)
+  uv_lt_8 = jnp.where(q < 8.0, u_lt_8 + v_lt_8, 1.0)
+
+  u_shift = jnp.where(u_lt_8 < 0.5, 1.0, 0.0)
+  v_shift = jnp.where(v_lt_8 < 0.5, 1.0, 0.0)
+  uv_shift = jnp.where(q < 0.5, 1.0, 0.0)
+
+  lg_u_shifted = lax.lgamma(u_lt_8 + u_shift)
+  lg_v_shifted = lax.lgamma(v_lt_8 + v_shift)
+  lg_uv_shifted = lax.lgamma(uv_lt_8 + uv_shift)
+
+  log_u_shift = jnp.where(u_lt_8 < 0.5, jnp.log(u_lt_8), 0.0)
+  log_v_shift = jnp.where(v_lt_8 < 0.5, jnp.log(v_lt_8), 0.0)
+  log_uv_shift = jnp.where(q < 0.5, jnp.log(uv_lt_8), 0.0)
+
+  # Regime 1 (q < 0.5) & Regime 2 (0.5 <= q < 8):
+  # Syntactically symmetric in (u, v), with lgamma evaluated only on [0.5, 16).
+  res_q_lt_8 = (
+      log_uv_shift
+      - (log_u_shift + log_v_shift)
+      + ((lg_u_shifted + lg_v_shifted) - lg_uv_shifted)
+  )
+
+  # Regime 3 & 4: q >= 8.
+  # When q > sqrt(MAX_FLOAT), rescale numerator and denominator by an exact
+  # power of 2 before dividing so lax.div's JVP rule (-dx * y * x^-2) never
+  # overflows the denominator's square.
+  q_large = jnp.where(q >= 8.0, q, 8.0)
+  p_large = jnp.where(q >= 8.0, p, 1.0)
+  rescale_thresh = 2.0**500 if u.dtype == np.float64 else 2.0**60
+  rescale_factor = _lax_const(
+      u, 2.0**-520 if u.dtype == np.float64 else 2.0**-70
+  )
+  one = _lax_const(u, 1.0)
+  scale_pq = jnp.where(
+      (q_large > rescale_thresh) & (p_large >= 1.0), rescale_factor, one
+  )
+  h = (p_large * scale_pq) / (q_large * scale_pq)
+  delta = _betaln_delta(p_large, q_large, h)
+
+  # Regime 3: p < 8 <= q.
+  lg_p = jnp.where(
+      u <= v, lg_u_shifted - log_u_shift, lg_v_shifted - log_v_shift
+  )
+  p_mid = jnp.where(p_large < 8.0, p_large, 1.0)
+  res_mid = (
+      lg_p
+      - p_mid * jnp.log(q_large)
+      + delta
+      + _stirling_remainder(q_large)
+      - _stirling_remainder(p_mid + q_large)
+  )
+
+  # Regime 4: 8 <= p <= q.
+  # For h >= 0.0625 (including all points near the diagonal u == v), use the
+  # symmetric Stirling form in (u, v) so values and higher-order derivatives
+  # are smooth across u == v. For h < 0.0625, use the cancellation-free
+  # expansion in h = p / q.
+  u_hi = jnp.where(p >= 8.0, u, 8.0)
+  v_hi = jnp.where(p >= 8.0, v, 8.0)
+  p_hi = jnp.where(p >= 8.0, p, 8.0)
+  scale_hi = jnp.where(q_large > rescale_thresh, rescale_factor, one)
+  u_s = u_hi * scale_hi
+  v_s = v_hi * scale_hi
+  p_s = p_hi * scale_hi
+  q_s = q_large * scale_hi
+  h_hi = p_s / q_s
+  half_log_2pi = _lax_const(u, 0.5 * math.log(2.0 * math.pi))
+  rem_both = (
+      _stirling_remainder(u_hi) + _stirling_remainder(v_hi)
+  ) - _stirling_remainder(u_hi + v_hi)
+
+  res_both_sym = (
+      half_log_2pi
+      - 0.25 * (jnp.log(u_hi) + jnp.log(v_hi))
+      - ((u_hi - 0.25) * jnp.log1p(v_s / u_s) + (v_hi - 0.25) * jnp.log1p(u_s / v_s))
+      + rem_both
+  )
+  p_asym = jnp.where(h_hi < 0.0625, p_hi, 8.0)
+  h_asym = jnp.where(h_hi < 0.0625, h_hi, 0.0625)
+  res_both_asym = (
+      half_log_2pi
+      - 0.5 * jnp.log(q_large)
+      + (p_asym - 0.5) * jnp.log(h_asym)
+      - p_asym
+      + delta
+      + rem_both
+  )
+  res_both_large = jnp.where(h_hi < 0.0625, res_both_asym, res_both_sym)
+
+  res_q_ge_8 = jnp.where(p < 8.0, res_mid, res_both_large)
+  return jnp.where(q < 8.0, res_q_lt_8, res_q_ge_8)
+
+
+def _log_abs_sinpi_reduced(d: Array) -> Array:
+  """Computes log(|sin(pi * d)|) for reduced d in [-0.5, 0.5]."""
+  d_safe = jnp.where(d == 0, 0.5, d)
+  abs_d = jnp.abs(d_safe)
+  # For tiny |d|, sin(pi * d) = pi * d * (1 - (pi * d)^2 / 6 + ...), avoiding
+  # subnormal underflow of pi * d near the float underflow threshold.
+  pi_d2 = lax.square(np.pi * d_safe)
+  small = (
+      _lax_const(d, math.log(math.pi))
+      + jnp.log(abs_d)
+      - pi_d2 * (1.0 / 6.0 + pi_d2 / 180.0)
+  )
+  general = jnp.log(jnp.abs(jnp.sin(np.pi * d_safe)))
+  return jnp.where(abs_d < 1e-4, small, general)
+
+
+@jit
+def _betaln(a: Array, b: Array) -> Array:
+  orig_dtype = a.dtype
+  if dtypes.finfo(orig_dtype).bits < 32:
+    a = a.astype(np.float32)
+    b = b.astype(np.float32)
+
+  p = jnp.where(a <= b, a, b)
+  q = jnp.where(a <= b, b, a)
+
+  # Sanitize non-finite values before evaluating finite branches.
+  finite_pq = jnp.isfinite(a) & jnp.isfinite(b)
+  a_f = jnp.where(finite_pq, a, 1.0)
+  b_f = jnp.where(finite_pq, b, 1.0)
+  p_f = jnp.where(a_f <= b_f, a_f, b_f)
+  q_f = jnp.where(a_f <= b_f, b_f, a_f)
+  s_f = a_f + b_f
+
+  # Reduce modulo 1 before forming sin(pi * x) so large magnitudes do not lose
+  # fractional precision and derivatives remain pi * cot(pi * x).
+  # Subtract r_d from the larger of |da|, |db| first so no low-order bit is lost
+  # when |da + db| > 0.5 and r_d == +-1.
+  da = a_f - lax.round(a_f, lax.RoundingMethod.TO_NEAREST_EVEN)
+  db = b_f - lax.round(b_f, lax.RoundingMethod.TO_NEAREST_EVEN)
+  r_d = lax.round(da + db, lax.RoundingMethod.TO_NEAREST_EVEN)
+  ds = jnp.where(jnp.abs(da) >= jnp.abs(db), (da - r_d) + db, (db - r_d) + da)
+
+  log_sin_a = _log_abs_sinpi_reduced(da)
+  log_sin_b = _log_abs_sinpi_reduced(db)
+  log_sin_p = jnp.where(a_f <= b_f, log_sin_a, log_sin_b)
+  log_sin_s = _log_abs_sinpi_reduced(ds)
+  log_pi = _lax_const(a_f, math.log(math.pi))
+
+  p_is_int = jnp.where(a_f <= b_f, da == 0, db == 0)
+  q_is_int = jnp.where(a_f <= b_f, db == 0, da == 0)
+  s_is_int = ds == 0
+  int_pole_cancels = p_is_int & q_is_int & (q_f > 0) & (s_f <= 0)
+
+  # Route all four sign/reflection regimes into a single _betaln_pos(u, v) call:
+  # 1. p_f > 0: +_betaln_pos(a_f, b_f)
+  # 2. p_f < 0 < q_f, s_f < 0.5: +_betaln_pos(1 - s_f, q_f) + log|sin(pi*s)/sin(pi*p)|
+  # 3. p_f < 0 < q_f, s_f >= 0.5: -_betaln_pos(1 - p_f, s_f) - log(q_f) + log(pi) - log|sin(pi*p)|
+  # 4. p_f <= q_f < 0: -_betaln_pos(1 - a_f, 1 - b_f) - log(1 - s_f) + log(pi) + log|sin(pi*s)/(sin(pi*a)sin(pi*b))|
+  both_pos = p_f > 0
+  mixed_sign = (p_f <= 0) & (q_f > 0)
+  mixed_s_lt_half = mixed_sign & (s_f < 0.5)
+  mixed_s_ge_half = mixed_sign & (s_f >= 0.5)
+
+  u = jnp.where(
+      both_pos,
+      a_f,
+      jnp.where(
+          mixed_s_lt_half,
+          1.0 - s_f,
+          jnp.where(mixed_s_ge_half, 1.0 - p_f, 1.0 - a_f),
+      ),
+  )
+  v = jnp.where(
+      both_pos,
+      b_f,
+      jnp.where(
+          mixed_s_lt_half,
+          q_f,
+          jnp.where(mixed_s_ge_half, s_f, 1.0 - b_f),
+      ),
+  )
+  base_pos = _betaln_pos(u, v)
+
+  q_pos_safe = jnp.where(q_f > 0, q_f, 1.0)
+  one_minus_s_safe = jnp.where(s_f < 0, 1.0 - s_f, 1.0)
+
+  res_neg_qpos_s_lt_half = base_pos + jnp.where(
+      int_pole_cancels, 0.0, log_sin_s - log_sin_p
+  )
+  res_neg_qpos_s_ge_half = (
+      -base_pos - jnp.log(q_pos_safe) + log_pi - log_sin_p
+  )
+  res_neg_qneg = (
+      -base_pos
+      - jnp.log(one_minus_s_safe)
+      + log_pi
+      + log_sin_s
+      - (log_sin_a + log_sin_b)
+  )
+
+  res_neg = jnp.where(
+      q_f > 0,
+      jnp.where(s_f < 0.5, res_neg_qpos_s_lt_half, res_neg_qpos_s_ge_half),
+      res_neg_qneg,
+  )
+
+  # Special values and poles for p <= 0:
+  # - Any zero argument returns +inf.
+  # - Negative integer p returns +inf unless q > 0 is an integer with p + q <= 0.
+  # - Negative integer q (with non-integer p < 0) returns +inf.
+  # - Non-positive integer p + q (with neither p nor q an integer) returns -inf.
+  is_pos_inf_pole = (
+      (p_f == 0)
+      | (q_f == 0)
+      | (p_is_int & ~int_pole_cancels)
+      | ((q_f < 0) & q_is_int)
+  )
+  is_neg_inf_pole = ~is_pos_inf_pole & ~int_pole_cancels & (s_f <= 0) & s_is_int
+  res_neg = jnp.where(
+      is_pos_inf_pole,
+      jnp.inf,
+      jnp.where(is_neg_inf_pole, -jnp.inf, res_neg),
+  )
+
+  res_finite = jnp.where(both_pos, base_pos, res_neg)
+
+  # Handle NaNs and infinities:
+  # - nan input or (+inf, +inf) -> nan
+  # - (-inf, anything) -> +inf
+  # - (p, +inf) with finite p > 0 -> -inf; with finite p <= 0 -> +inf
+  is_nan = jnp.isnan(a) | jnp.isnan(b) | (isposinf(p) & isposinf(q))
+  res_inf = jnp.where(
+      isneginf(p),
+      jnp.inf,
+      jnp.where(p > 0, -jnp.inf, jnp.inf),
+  )
+  res = jnp.where(is_nan, jnp.nan, jnp.where(finite_pq, res_finite, res_inf))
+  return res.astype(orig_dtype)
+
+
 def betaln(a: ArrayLike, b: ArrayLike) -> Array:
   r"""Natural log of the absolute value of the beta function
 
@@ -341,7 +647,9 @@ def betaln(a: ArrayLike, b: ArrayLike) -> Array:
     :func:`jax.scipy.special.beta`
   """
   a, b = promote_args_inexact("betaln", a, b)
-  return _betaln_impl(a, b)
+  if dtypes.issubdtype(a.dtype, np.complexfloating):
+    raise ValueError("betaln does not support complex-valued inputs.")
+  return _betaln(a, b)
 
 
 def factorial(n: ArrayLike, exact: bool = False) -> Array:
