@@ -9852,8 +9852,6 @@ def _unary_reduce_lower(reducer, unit_factory, ctx, x, *, axes, **kwargs):
     hlo.return_([reducer(*reducer_region.arguments)])
   return [mlir.lower_with_sharding_in_types(ctx, op.result, aval_out)]
 
-mlir.register_lowering(reduce_sum_p, partial(_unary_reduce_lower, hlo.AddOp,
-                                             _get_sum_identity))
 mlir.register_lowering(reduce_prod_p, partial(_unary_reduce_lower, hlo.MulOp,
                                               _get_prod_identity))
 mlir.register_lowering(reduce_or_p, partial(_unary_reduce_lower, hlo.OrOp,
@@ -9862,10 +9860,129 @@ mlir.register_lowering(reduce_and_p, partial(_unary_reduce_lower, hlo.AndOp,
                                              _get_bitwise_and_identity))
 mlir.register_lowering(reduce_xor_p, partial(_unary_reduce_lower, hlo.XorOp,
                                              _get_bitwise_or_identity))
-mlir.register_lowering(reduce_min_p, partial(_unary_reduce_lower, mlir.min_hlo,
-                                             _get_min_identity))
-mlir.register_lowering(reduce_max_p, partial(_unary_reduce_lower, mlir.max_hlo,
-                                             _get_max_identity))
+
+def _lower_with_shard_map_collectives(
+    prim, default_rule, collective_rule, ctx, *args, **params):
+  if not config.shard_map_partitioning.value:
+    return default_rule(ctx, *args, **params)
+  out_aval, = ctx.avals_out
+  mesh = out_aval.sharding.mesh
+  if not mesh.explicit_axes:
+    return default_rule(ctx, *args, **params)
+  # Skip unreduced shardings; HiJAX will eliminate MLIR-level unreduced.
+  if any(isinstance(a, core.ShapedArray) and a.sharding.spec.unreduced
+         for a in (*ctx.avals_in, out_aval)):
+    # TODO(rdyro): Delete this once unreduced in hijax lands.
+    return default_rule(ctx, *args, **params)
+  in_collective, out_collective = collective_rule(
+      *ctx.avals_in, out_aval, **params)
+  if in_collective is None and out_collective is None:
+    return default_rule(ctx, *args, **params)
+  from jax._src import shard_map  # pyrefly: ignore[missing-import]
+  per_shard_params = params
+  if 'out_sharding' in params:
+    if (out_sharding := params['out_sharding']) is not None:
+      assert out_sharding.mesh.explicit_axes == mesh.explicit_axes
+    per_shard_params = params | {'out_sharding': None}
+
+  def lower_fn(*operands):
+    @partial(shard_map.shard_map, mesh=mesh, out_specs=out_aval.sharding.spec,
+             axis_names=set(mesh.explicit_axes))
+    def body(*xs):
+      if in_collective is not None:
+        xs = in_collective(*xs)
+      ans = prim.bind(*xs, **per_shard_params)
+      if out_collective is not None:
+        ans = out_collective(ans)
+      return ans
+    return body(*operands)
+
+  return mlir.lower_fun(lower_fn, multiple_results=False)(ctx, *args)
+
+def _as_spec_tuple(s) -> tuple[AxisName, ...]:
+  if s is None:
+    return ()
+  return s if isinstance(s, tuple) else (s,)
+
+def _reduce_op_collectives(in_aval, out_aval, axes):
+  in_spec, out_spec = in_aval.sharding.spec, out_aval.sharding.spec
+  axes_set = frozenset(axes)
+  # Kept (non-reduced) dimensions inherit their input partition specs as a
+  # prefix; any trailing axes added by `out_sharding` from the reduced input
+  # dimensions become reduce-scatters, while other reshards are skipped.
+  kept_dim_specs = tuple(
+      s for i, s in enumerate(in_spec.partitions) if i not in axes_set)
+  reduced_in_axes = lax_utils._get_spec_set(
+      s for i, s in enumerate(in_spec.partitions) if i in axes_set)
+  scatters: list[tuple[int, tuple[AxisName, ...]]] = []
+  for dim, (kept_s, out_s) in enumerate(
+      safe_zip(kept_dim_specs, out_spec.partitions)):
+    kept_t, out_t = _as_spec_tuple(kept_s), _as_spec_tuple(out_s)
+    if out_t[:len(kept_t)] != kept_t:
+      return None
+    if added_t := out_t[len(kept_t):]:
+      if not all(a in reduced_in_axes for a in added_t):
+        return None
+      scatters.append((dim, added_t))
+  scattered_axes = frozenset(a for _, added_t in scatters for a in added_t)
+  all_reduce_axes = core.order_wrt_mesh(
+      out_aval.sharding.mesh, reduced_in_axes - scattered_axes)
+  return all_reduce_axes, tuple(scatters)
+
+def _make_reduce_out_collective(all_reduce_fn, scatter_fn, all_reduce_axes,
+                                scatters):
+  def out_collective(y):
+    if all_reduce_axes:
+      y = all_reduce_fn(y, all_reduce_axes)
+    for dim, scatter_axes in scatters:
+      y = scatter_fn(y, scatter_axes, scatter_dimension=dim, tiled=True)
+    return y
+  return out_collective
+
+def _reduce_sum_collective_rule(in_aval, out_aval, *, axes, out_sharding):
+  del out_sharding
+  if (plan := _reduce_op_collectives(in_aval, out_aval, axes)) is None:
+    return None, None
+  all_reduce_axes, scatters = plan
+  if not all_reduce_axes and not scatters:
+    return None, None
+  from jax._src.lax import parallel
+  return None, _make_reduce_out_collective(
+      parallel.psum, parallel.psum_scatter, all_reduce_axes, scatters)
+
+def _reduce_min_collective_rule(in_aval, out_aval, *, axes, out_sharding):
+  del out_sharding
+  if (plan := _reduce_op_collectives(in_aval, out_aval, axes)) is None:
+    return None, None
+  all_reduce_axes, scatters = plan
+  if scatters or not all_reduce_axes:
+    return None, None
+  from jax._src.lax import parallel
+  return None, lambda y: parallel.pmin(y, all_reduce_axes)
+
+def _reduce_max_collective_rule(in_aval, out_aval, *, axes, out_sharding):
+  del out_sharding
+  if (plan := _reduce_op_collectives(in_aval, out_aval, axes)) is None:
+    return None, None
+  all_reduce_axes, scatters = plan
+  if scatters or not all_reduce_axes:
+    return None, None
+  from jax._src.lax import parallel
+  return None, lambda y: parallel.pmax(y, all_reduce_axes)
+
+def _register_reduce_lowering(prim, reducer, unit_factory, collective_rule):
+  mlir.register_lowering(
+      prim,
+      partial(_lower_with_shard_map_collectives, prim,
+              partial(_unary_reduce_lower, reducer, unit_factory),
+              collective_rule))
+
+_register_reduce_lowering(
+    reduce_sum_p, hlo.AddOp, _get_sum_identity, _reduce_sum_collective_rule)
+_register_reduce_lowering(
+    reduce_min_p, mlir.min_hlo, _get_min_identity, _reduce_min_collective_rule)
+_register_reduce_lowering(
+    reduce_max_p, mlir.max_hlo, _get_max_identity, _reduce_max_collective_rule)
 
 
 def _reduce_precision_shape_rule(operand, *, exponent_bits, mantissa_bits):

@@ -474,6 +474,21 @@ jax_multiplatform_test(
 )
 
 jax_multiplatform_test(
+    name = "partitioning_test",
+    srcs = ["partitioning_test.py"],
+    shard_count = {
+        "cpu": 4,
+        "gpu": 2,
+        "tpu": 4,
+    },
+    tags = ["multiaccelerator"],
+    deps = py_deps([
+        "absl/testing",
+        "numpy",
+    ]),
+)
+
+jax_multiplatform_test(
     name = "pjit_test",
     srcs = ["pjit_test.py"],
     backend_tags = {
