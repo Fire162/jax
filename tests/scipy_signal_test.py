@@ -144,6 +144,32 @@ class LaxBackedScipySignalTests(jtu.JaxTestCase):
     self._CompileAndCheck(jsp_fun, args_maker, rtol=tol, atol=tol)
 
   @jtu.sample_product(
+    xshape=[(8, 2), (2, 8)],
+    yshape=[(3, 5), (5, 3)],
+    dtype=default_dtypes,
+    mode=['full', 'same'],
+    op=['convolve', 'correlate'],
+    method=['auto', 'direct'],
+  )
+  def testConvolutionsMixedSizes(self, xshape, yshape, dtype, mode, op, method):
+    jsp_op = getattr(jsp_signal, op)
+    osp_op = getattr(osp_signal, op)
+    rng = jtu.rand_default(self.rng())
+    args_maker = lambda: [rng(xshape, dtype), rng(yshape, dtype)]
+    osp_fun = partial(osp_op, mode=mode, method=method)
+    jsp_fun = partial(jsp_op, mode=mode, method=method, precision=lax.Precision.HIGHEST)
+    tol = {np.float16: 1e-2, np.float32: 1e-2, np.float64: 1e-12,
+           np.complex64: 1e-2, np.complex128: 1e-12}
+    self._CheckAgainstNumpy(osp_fun, jsp_fun, args_maker, check_dtypes=False, tol=tol)
+    self._CompileAndCheck(jsp_fun, args_maker, rtol=tol, atol=tol)
+
+  def testConvolutionsMixedSizesValidModeError(self):
+    x = jnp.ones((8, 2), dtype=jnp.float32)
+    y = jnp.ones((3, 5), dtype=jnp.float32)
+    with self.assertRaisesRegex(ValueError, "One input must be smaller than the other in every dimension."):
+      jsp_signal.convolve(x, y, mode='valid', method='direct')
+
+  @jtu.sample_product(
     shape=[(5,), (4, 5), (3, 4, 5)],
     dtype=jtu.dtypes.floating + jtu.dtypes.integer,
     axis=[0, -1],
